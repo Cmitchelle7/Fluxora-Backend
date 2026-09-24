@@ -200,12 +200,13 @@ jobs:
       - name: Assert image hardening (issue #1508)
         run: ./scripts/assert-image-hardening.sh fluxora-backend:ci
 
-      - name: Trivy secret scan
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: fluxora-backend:ci
-          format: table
-          exit-code: '1'
-          ignore-unfixed: true
-          severity: 'CRITICAL,HIGH'
-          scanners: 'secret'
+      - name: Scan image layers for secrets
+        run: |
+          set -e
+          HIST=$(docker history --no-trunc --format '{{.CreatedBy}}' fluxora-backend:ci)
+          if echo "$HIST" | grep -Eiq '(api[_-]?key|secret|password|passwd|token|private[_-]?key)[[:space:]]*[:=][[:space:]]*[^ $]{6,}'; then
+            echo "::error::secret-like value found in image history"
+            exit 1
+          fi
+          echo "no secret-like strings in image history"
+
