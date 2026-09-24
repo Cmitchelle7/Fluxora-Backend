@@ -5,16 +5,19 @@ FROM node:18-alpine AS builder
 
 WORKDIR /app
 
+# Install pnpm at a fixed version globally (corepack on alpine is flaky in CI)
+RUN npm install -g pnpm@9.15.9
+
 COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
 
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
+    pnpm install --frozen-lockfile --ignore-scripts
 
 COPY . .
 RUN pnpm run build
 
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
-    pnpm prune --prod
+    pnpm prune --prod --ignore-scripts
 
 # ---------- Production stage ----------
 FROM node:18-alpine AS runtime
@@ -31,7 +34,6 @@ RUN addgroup -g 10001 -S fluxora && \
 COPY --from=builder --chown=10001:10001 /app/node_modules ./node_modules
 COPY --from=builder --chown=10001:10001 /app/dist         ./dist
 COPY --from=builder --chown=10001:10001 /app/package.json ./package.json
-COPY --from=builder --chown=10001:10001 /app/pnpm-lock.yaml* ./
 
 RUN mkdir -p /app/tmp && chown -R 10001:10001 /app/tmp
 
