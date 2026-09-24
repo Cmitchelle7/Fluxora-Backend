@@ -201,7 +201,7 @@ jobs:
         run: ./scripts/assert-image-hardening.sh fluxora-backend:ci
 
       - name: Trivy secret scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.20.0
         with:
           image-ref: fluxora-backend:ci
           format: table
