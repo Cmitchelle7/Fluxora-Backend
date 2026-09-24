@@ -5,8 +5,6 @@ FROM node:18-alpine AS builder
 
 WORKDIR /app
 
-RUN corepack enable
-
 COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
 
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
@@ -29,8 +27,6 @@ WORKDIR /app
 
 RUN addgroup -g 10001 -S fluxora && \
     adduser  -S -u 10001 -G fluxora -h /app -s /sbin/nologin fluxora
-
-RUN corepack enable
 
 COPY --from=builder --chown=10001:10001 /app/node_modules ./node_modules
 COPY --from=builder --chown=10001:10001 /app/dist         ./dist
