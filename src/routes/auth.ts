@@ -3,11 +3,11 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { generateToken } from '../lib/auth.js';
 import { validationError, unauthorized, asyncHandler } from '../middleware/errorHandler.js';
-import { info } from '../utils/logger.js';
+import { info } from '../lib/logger.js';
 import { getConfig } from '../config/env.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { revoke } from '../redis/jwtRevocationStore.js';
-import { Permission, requirePermission } from '../middleware/auth.js';
+import { Permission, authenticate, requirePermission } from '../middleware/auth.js';
 import { authLockoutMiddleware } from '../middleware/authLockout.js';
 import { getClientIp } from '../ws/connectionLimiter.js';
 
@@ -104,7 +104,7 @@ authRouter.post(
         if (!req.body.role) {
           targetRole = verified.role;
         }
-      } catch (err) {
+      } catch {
         const store = req.authAttemptStore;
         const ip = getClientIp(req);
         if (store) {
@@ -132,10 +132,7 @@ authRouter.post(
       await store.resetAttempts(targetAddress);
     }
 
-    res.json({
-      token,
-      user: { address: targetAddress, role: targetRole },
-    });
+    res.json(successResponse({ token, user: { address: targetAddress, role: targetRole } }, requestId));
   })
 );
 
@@ -200,6 +197,9 @@ const RevokeRequestSchema = z.object({
  */
 authRouter.post(
   '/revoke',
+  // #1579: requirePermission only reads req.user; without `authenticate`
+  // first nothing set it, so every caller (admins included) got 401.
+  authenticate,
   requirePermission(Permission.ADMIN_PAUSE), // Admin-only: any admin permission suffices
   asyncHandler(async (req: Request, res: Response) => {
     const result = RevokeRequestSchema.safeParse(req.body);
@@ -223,11 +223,10 @@ authRouter.post(
       requestId,
     });
 
-    res.json({
-      success: true,
+    res.json(successResponse({
       jti,
       revoked: revocation.revoked,
       ttl: revocation.ttlSeconds,
-    });
+    }, requestId));
   })
 );

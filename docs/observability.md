@@ -142,8 +142,24 @@ rate(fluxora_db_query_errors_total[5m]) > 0
 ```
 
 ## Prometheus scrape configuration
+## Prometheus scrape configuration & Access Rules
 
-`GET /metrics` is protected by the same `ADMIN_API_KEY` Bearer token used by other admin routes. Prometheus scrape jobs must supply the token via the `Authorization` header.
+`GET /metrics` exposes internal operational metrics (traffic volumes, error rates, tenant counts, and component latencies) and is strictly protected from public access.
+
+### Authorization & Access Control
+- **Static Bearer Token**: `GET /metrics` requires a valid Bearer token matching the `ADMIN_API_KEY` environment variable (`Authorization: Bearer <ADMIN_API_KEY>`).
+- **JWT Authorization**: Requests carrying a signed JWT with the `admin` or `data-protection-officer` role are also authorized.
+- **Fail-Closed**: When `ADMIN_API_KEY` is not configured, the service fails closed and refuses all requests with `503 Service Unavailable`.
+- **Refusal & Logging**: Unauthenticated or unauthorized requests are refused immediately (401, 403, or 503) and logged as structured security warnings containing the request path, method, and client IP. No token or secret material is ever logged.
+
+### Network Interface & Internal Boundary
+In production deployments, the metrics endpoint must not be exposed to the public internet:
+- **Internal Interface Binding**: Ingress controllers, API gateways, or reverse proxies (such as Nginx, Traefik, or AWS ALB) must block external routing to `/metrics`.
+- **Private Scraping VPC**: Prometheus scrape jobs should access `/metrics` over internal VPC networks, private subnets, or dedicated management interfaces.
+
+### Cardinality & Privacy Guarantees
+- **No Per-User PII**: Metric labels are bounded to low-cardinality enum values (e.g. `method`, `route`, `status_code`, `outcome`, `status`, `reason`).
+- **No High-Cardinality User Identifiers**: Per-user identifiers, Stellar wallet addresses (`G...`), email addresses, user IDs, or API keys are strictly forbidden from metric label dimensions to prevent cardinality explosion and PII leakage in observability systems.
 
 ### Environment variable
 
@@ -165,12 +181,12 @@ scrape_configs:
 
 ### Response codes
 
-| Status | Cause |
-|--------|-------|
-| `200` | Valid token — metrics payload returned |
-| `401` | Missing or malformed `Authorization` header |
-| `403` | Token present but incorrect |
-| `503` | `ADMIN_API_KEY` not configured on the server |
+| Status | Cause | Logging |
+|--------|-------|---------|
+| `200` | Valid `ADMIN_API_KEY` or admin JWT token — metrics payload returned | Standard request log |
+| `401` | Missing or malformed `Authorization` header | Warning logged with path, method, client IP |
+| `403` | Token present but incorrect, or insufficient JWT role | Warning logged with path, method, client IP |
+| `503` | `ADMIN_API_KEY` not configured on the server | Warning logged with path, method, client IP |
 
 ## Runtime Performance Metrics
 
@@ -276,6 +292,7 @@ The per-client gauges below expose `ws.bufferedAmount` directly so operators can
 | `fluxora_ws_backpressure_buffered_bytes` | Gauge | `connection_id` (UUID v4) | Current `ws.bufferedAmount` per connected `/ws/streams` client, in bytes. Sampled every 5s by the hub's collector and rounded to non-negative integers. |
 | `fluxora_ws_max_buffered_bytes` | Gauge | — | Maximum `ws.bufferedAmount` observed across all live clients at the most recent sample. Useful for dashboards: spikes here precede drops. |
 | `fluxora_ws_slow_clients` | Gauge | — | Count of live clients whose `bufferedAmount` exceeds the slow threshold (default 1 MiB). |
+| `fluxora_ws_connection_health_total` | Gauge | `status` (closed set: `healthy`, `stalled`, `unhealthy`) | Live connections by health status. `stalled` counts `OPEN` connections whose outbound queue is saturated above `healthProbeStallBytes` (default 1 MiB) — an open-but-not-draining connection is reported as stalled, never healthy. Cardinality is fixed at 3. |
 | `fluxora_ws_broadcast_batch_flush_seconds` | Histogram | — | Age in seconds of the oldest event included in a micro-batched WebSocket broadcast flush. Bounded O(1) cardinality (zero labels). |
 
 ### Micro-Batch Broadcast Flush Latency
@@ -312,6 +329,7 @@ The aggregated `fluxora_ws_max_buffered_bytes` and `fluxora_ws_slow_clients` car
 |------------------|---------|-------------|
 | `backpressureCollector.intervalMs` | `5000` | Poll interval. Set to `0` to disable the periodic collector entirely (gauge updates still happen during broadcast / send activity). |
 | `backpressureCollector.slowThresholdBytes` | `1048576` (1 MiB) | Threshold above which a client is counted in `fluxora_ws_slow_clients`. |
+| `healthProbeStallBytes` | `1048576` (1 MiB) | Outbound `bufferedAmount` above which an `OPEN` connection is counted in `fluxora_ws_connection_health_total{status="stalled"}` instead of `healthy`. Defaults to `BACKPRESSURE_DROP_BYTES`. |
 
 ### PromQL examples
 
@@ -333,11 +351,18 @@ Alert: more than 5 slow clients sustained over 5 minutes:
 fluxora_ws_slow_clients > 5
 ```
 
+Alert: any open connection stalled beyond a heartbeat interval (2 minutes):
+
+```promql
+fluxora_ws_connection_health_total{status="stalled"} > 0
+```
+
 ### Thresholding strategy
 
 - **`fluxora_ws_slow_clients > 0` for > 2 min**: investigate the highest entries of `topk(5, fluxora_ws_backpressure_buffered_bytes)` and look for one or two clients with `correlation_id` entries repeated in the structured `ws_backpressure` warning logs.
 - **`max(fluxora_ws_backpressure_buffered_bytes) > 4 MiB`** (terminate threshold): one or more clients are about to be force-closed by the hub. Operators can proactively identify the offending connection via `topk(1, fluxora_ws_backpressure_buffered_bytes)`.
 - **`fluxora_ws_max_buffered_bytes` rising without `fluxora_ws_slow_clients` rising**: one client is filling up but stays below the slow threshold — still worth checking `topk(1, ...)` to confirm it's not unbounded.
+- **`fluxora_ws_connection_health_total{status="stalled"} > 0` for > 2 min**: at least one `OPEN` connection is not draining its outbound queue (network partition or wedged consumer). Cross-reference `topk(5, fluxora_ws_backpressure_buffered_bytes)` to identify the peer before the hub escalates to drop/terminate.
 
 ### Affected source files
 
@@ -487,10 +512,18 @@ accurate during a Redis outage.
 
 ```
 closed ──(threshold reached)──▸ open
- open  ──(reset period elapsed)──▸ half-open
+  open  ──(reset period elapsed)──▸ half-open
 half-open ──(probe succeeds)──▸ closed
 half-open ──(probe fails)──▸ open
 ```
+
+Thresholds: the circuit opens on the `WEBHOOK_CIRCUIT_BREAKER_THRESHOLD`-th consecutive
+retryable failure (default `0` = disabled) and stays open for
+`WEBHOOK_CIRCUIT_BREAKER_RESET_MS` (default `300000`) before one half-open probe is admitted.
+The full transition table, and the per-receiver state exposed by
+`GET /internal/webhooks/circuit-breakers?endpointUrl=…` (including the machine-readable
+`reason` a receiver's deliveries are paused and the `resumeAt` timestamp), are documented in
+[`docs/webhooks.md`](webhooks.md#circuit-breaker-resilience).
 
 ### PromQL examples
 
@@ -567,8 +600,8 @@ dashboard can reuse the same PromQL shapes and panel layouts as the HTTP one.
 
 | Metric Name | Type | Description | Labels / Buckets |
 | :--- | :--- | :--- | :--- |
-| `indexer_batches_processed_total` | Counter | Every batch processing step executed, successful or not. | `contract_id`, `outcome` (`success` \| `error`) |
-| `indexer_batch_errors_total` | Counter | Batch processing steps that threw. | `contract_id`, `error_source` (`stellar_rpc` \| `local`), `error_type` |
+| `indexer_batches_processed_total` | Counter | Every batch processing step executed, successful, partial, or failed. | `contract_id`, `outcome` (`success` \| `partial` \| `error`) |
+| `indexer_batch_errors_total` | Counter | Batch processing steps that failed — wholly (`outcome="error"`) **or** partially (`outcome="partial"`). | `contract_id`, `error_source` (`stellar_rpc` \| `local`), `error_type` |
 | `indexer_batch_duration_seconds` | Histogram | Wall-clock duration of one batch processing step. | `contract_id`, `outcome`; buckets `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]` |
 
 **What counts as one batch processing step?** One iteration of the `replayEvents`
@@ -583,6 +616,32 @@ place where `indexer_batches_processed_total` can exceed the pre-existing
 `indexer_replay_batches_committed_total`, which counts only batches that reached
 `COMMIT`.
 
+### `outcome="partial"` — a batch that did work but did not land
+
+A batch does not only fail by throwing. The common case in ingestion is a
+**partial** failure: the batch ran and produced rows, and those rows were then
+discarded. Today the replay loop hits this whenever a stop is requested
+mid-batch — `ReplayBatchRunner.processBatch` rolls the in-flight transaction
+back before `COMMIT`, so every row the batch fetched is dropped and the ledger
+range is **not** advanced. Nothing throws on that path.
+
+Recording such a batch as a `success` is what let the error rate report a
+healthy zero while rows were being thrown away. `recordIndexerBatchPartialFailure`
+instead records all three RED signals:
+
+- `indexer_batches_processed_total{outcome="partial"}` — the batch is in the
+  denominator exactly once.
+- `indexer_batch_duration_seconds{outcome="partial"}` — the work was done, so the
+  duration is meaningful.
+- `indexer_batch_errors_total{error_source="local", error_type="batch_aborted"}` —
+  the partial failure is counted **as an error**, so the error-ratio query below
+  needs no change and never understates the failure rate.
+
+The `outcome` label is the authoritative whole-vs-partial split;
+`error_type="batch_aborted"` identifies the partial drop on the error counter.
+The reason is a closed union (`batch_aborted`, `unknown`), normalised at record
+time, so a widened caller cannot mint a new series.
+
 ### `error_source` — upstream vs. local failures
 
 The `error_source` label answers "is this our problem or the RPC provider's?"
@@ -591,7 +650,7 @@ without opening a log.
 | `error_source` | Origin | `error_type` values |
 | :--- | :--- | :--- |
 | `stellar_rpc` | A call into `src/services/stellar-rpc.ts` failed. Retrying the indexer will not help until the provider recovers. | `timeout`, `network`, `provider`, `circuit_open`, `cancelled` |
-| `local` | The failure was raised inside the indexer process. Actionable by the indexer owner. | `db_pool_exhausted`, `db_query_timeout`, `db_duplicate_entry`, `db_error`, `unknown` |
+| `local` | The failure was raised inside the indexer process, or the batch only partially succeeded. Actionable by the indexer owner. | `db_pool_exhausted`, `db_query_timeout`, `db_duplicate_entry`, `db_error`, `batch_aborted`, `unknown` |
 
 `error_type` for `stellar_rpc` mirrors the `RpcFailureKind` union exported by
 `src/services/stellar-rpc.ts` (lower-snake-cased). Classification is structural
@@ -599,8 +658,9 @@ without opening a log.
 by an intermediate layer is still attributed to `stellar_rpc`.
 
 Every increment of `indexer_batch_errors_total` is paired with an
-`outcome="error"` increment of `indexer_batches_processed_total`, so the error
-ratio is well-defined against either denominator.
+`outcome="error"` or `outcome="partial"` increment of
+`indexer_batches_processed_total`, so the error ratio is well-defined against
+either denominator.
 
 ### Dashboard queries
 
@@ -608,12 +668,16 @@ ratio is well-defined against either denominator.
 # Rate — batches/sec being processed, per contract
 sum(rate(indexer_batches_processed_total[5m])) by (contract_id)
 
-# Errors — overall error ratio
+# Errors — overall error ratio (includes partial failures)
 sum(rate(indexer_batch_errors_total[5m]))
   / sum(rate(indexer_batches_processed_total[5m]))
 
 # Errors — is it us or the provider?
 sum(rate(indexer_batch_errors_total[5m])) by (error_source, error_type)
+
+# Partial failures — share of batches that did work but were dropped
+sum(rate(indexer_batches_processed_total{outcome="partial"}[5m]))
+  / sum(rate(indexer_batches_processed_total[5m]))
 
 # Duration — p50 / p95 / p99 of a batch
 histogram_quantile(0.50, sum(rate(indexer_batch_duration_seconds_bucket[5m])) by (le))
@@ -636,6 +700,21 @@ groups:
           severity: warning
         annotations:
           summary: "More than 5% of indexer batches are failing"
+
+      # Partial failures: rows are being dropped even though nothing threw.
+      # Threshold: > 1% of processed batches for 10m. Below that, a single
+      # aborted batch during a rolling deploy or shutdown is noise; above it,
+      # a resume is owed and ledger lag will keep climbing.
+      - alert: IndexerBatchPartialFailureHigh
+        expr: |
+          sum(rate(indexer_batches_processed_total{outcome="partial"}[5m]))
+            / sum(rate(indexer_batches_processed_total[5m])) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 1% of indexer batches are partially failing — rows are being dropped"
+          description: "Partial batches did work but were rolled back before COMMIT. Check replay_stopped_* logs and re-run the replay for the affected range."
 
       - alert: IndexerUpstreamRpcDegraded
         expr: sum(rate(indexer_batch_errors_total{error_source="stellar_rpc"}[5m])) > 0
@@ -668,9 +747,13 @@ groups:
   `src/metrics/indexerRed.ts`. **Raw error messages are never used as label
   values**, so an error carrying user input, credentials, or PII cannot leak
   into the `/metrics` payload or inflate cardinality.
+- The partial-failure reason is normalised against a closed allow-list, so an
+  unrecognised value collapses to `unknown` instead of becoming a new series.
 - The classifier is total: a thrown string, `null`, or an unrecognised object
   yields `local` / `unknown` rather than throwing. Metric recording can never
   mask the original batch failure — the error is always rethrown to the caller.
+- `tests/metrics/indexerRed.test.ts` drives both the abort path and the
+  wholly-failed path and asserts the published `/metrics` values.
 
 
 ## Config reload metrics (SIGHUP)
@@ -684,3 +767,9 @@ Hot-config refresh emits the following Prometheus series (no secret labels):
 | `fluxora_config_reload_generation` | Gauge | — | Last successfully applied generation |
 
 See also [env-reload-behavior.md](./env-reload-behavior.md).
+
+## Metric label cardinality
+
+See [metric-cardinality.md](./observability/metric-cardinality.md) for the
+policy that bounds Prometheus label values (no stream IDs, path parameters,
+or tenants as labels). Enforcement: `src/metrics/cardinality.ts`.

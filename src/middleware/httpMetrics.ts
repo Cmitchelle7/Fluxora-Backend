@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { httpRequestsTotal, httpRequestDurationSeconds } from '../metrics.js';
 import { sanitizeMetricLabels } from '../pii/secretPatterns.js';
+import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /** Single label for requests that never matched an Express route. */
 export const UNMATCHED_ROUTE = 'unmatched';
@@ -11,6 +12,12 @@ export const UNMATCHED_ROUTE = 'unmatched';
  * Uses `baseUrl + route.path` (the pattern, e.g. `/users/:id`) so path
  * parameters never appear as distinct series. Unmatched requests share one
  * fixed label to keep cardinality bounded.
+
+/**
+ * Resolve the Prometheus `route` label from the matched Express route template.
+ *
+ * Unmatched requests use one fixed label so arbitrary paths cannot create
+ * unbounded Prometheus series.
  */
 export function resolveRoute(req: Request): string {
   if (!req.route?.path) {

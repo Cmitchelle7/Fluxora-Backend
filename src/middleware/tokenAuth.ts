@@ -1,13 +1,31 @@
-import type { NextFunction, Request, RequestHandler, Response } from 'express';
+/**
+ * Streaming-transport token check — NOT an HTTP authentication entry point (#1579).
+ *
+ * verifyWsToken authenticates WebSocket upgrades (src/ws/hub.ts) and is the
+ * extra `?token=` check on the SSE / long-poll stream routes, where browsers
+ * cannot set headers. Those stream routes are still guarded by
+ * authenticateApiKey + requireScope from src/middleware/auth.ts first; this is
+ * an addition, never a replacement. verifyWsToken checks the JWT signature
+ * only (no issuer / audience / revocation checks), so it must not be the sole
+ * guard on any HTTP route. See docs/auth.md.
+ *
+ * createBearerTokenAuth (static shared-token bearer check) was removed in
+ * #1579: no route used it, it compared tokens with `!==` instead of in
+ * constant time, and requireAdminAuth already covers static-token admin
+ * access properly.
+ */
 import type { IncomingMessage } from 'http';
+import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import jwt from 'jsonwebtoken';
 
-import { serviceUnavailable, unauthorized } from '../errors.js';
+import { unauthorized } from '../errors.js';
+
 import { logger } from '../lib/logger.js';
 import { recordAuditEvent } from '../lib/auditLog.js';
 import { wsAuthFailureTotal } from '../metrics/businessMetrics.js';
 import { verifyIdToken } from '../services/oidcProvider.js';
 import { isRevoked } from '../redis/jwtRevocationStore.js';
+import { unauthorized } from './errorHandler.js';
 
 // ── WebSocket JWT auth ────────────────────────────────────────────────────────
 
@@ -154,7 +172,7 @@ export function createBearerTokenAuth(options: TokenAuthOptions): RequestHandler
       }
       
       next();
-    } catch (err) {
+    } catch {
       next(
         unauthorized(`Invalid ${options.role} bearer token`, {
           role: options.role,

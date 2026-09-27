@@ -26,6 +26,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { payloadTooLarge, requestTimeout, validationError } from './errorHandler.js';
 import { requestBodyTooLargeTotal } from '../metrics/requestProtectionMetrics.js';
+import { normalizeRouteLabel } from '../metrics/cardinality.js';
 
 /**
  * Derive a normalized route path label for metrics.
@@ -39,9 +40,13 @@ import { requestBodyTooLargeTotal } from '../metrics/requestProtectionMetrics.js
  * @internal
  */
 function normalizedPath(req: Request): string {
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
   const routePath = (req as unknown as { route?: { path?: string } }).route?.path;
-  return typeof routePath === 'string' ? routePath : req.path;
+  // Prefer the Express route template (already bounded). Fallback paths may
+  // contain path parameters — run them through the cardinality normaliser.
+  if (typeof routePath === 'string') {
+    return routePath;
+  }
+  return normalizeRouteLabel(req.path);
 }
 
 // ── Idempotency-Key constants ─────────────────────────────────────────────────
@@ -58,6 +63,7 @@ export const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9:_-]+$/;
  * Default decompressed payload limit: 256 KiB
  */
 export const DEFAULT_RAW_LIMIT_BYTES = 256 * 1024;
+export const BODY_LIMIT_BYTES = DEFAULT_RAW_LIMIT_BYTES;
 export const DEFAULT_DECOMPRESSED_LIMIT_BYTES = 256 * 1024;
 
 export interface RouteLimit {
